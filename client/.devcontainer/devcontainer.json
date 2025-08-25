@@ -1,0 +1,19 @@
+{
+  "name": "client",
+  "dockerComposeFile": "../../docker-compose.yml",
+  "service": "client",
+  "workspaceFolder": "/workspace/client",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ]
+    },
+    "settings": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode",
+      "editor.formatOnSave": true
+    }
+  }
+}

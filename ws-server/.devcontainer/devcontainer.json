@@ -1,0 +1,25 @@
+{
+  "name": "axum",
+  "dockerComposeFile": "../../docker-compose.yml",
+  "service": "rust",
+  "workspaceFolder": "/workspace/ws-server",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "dustypomerleau.rust-syntax",
+        "jscearcy.rust-doc-viewer",
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi"
+      ],
+      "settings": {
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+services:
+  rust:
+    build:
+      context: .
+      dockerfile: ./ws-server/.devcontainer/Dockerfile
+    tty: true
+    ports:
+      - 8000:8000
+    volumes:
+      - .:/workspace
+    depends_on:
+      - redis
+  client:
+    build:
+      context: .
+      dockerfile: ./client/.devcontainer/Dockerfile
+    tty: true
+    ports:
+       - 5173:5173
+    volumes:
+      - .:/workspace
+  redis:
+    image: redis:latest
+    ports:
+      - 6379:6379
