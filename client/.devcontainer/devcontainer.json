@@ -3,6 +3,7 @@
   "dockerComposeFile": "../../docker-compose.yml",
   "service": "client",
   "workspaceFolder": "/workspace/client",
+  "remoteUser": "root",
   "customizations": {
     "vscode": {
       "extensions": [
