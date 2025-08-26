@@ -1,17 +1,17 @@
-use std::{collections::HashMap, sync::Arc};
-
 use axum::{
     Router,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::Response,
+    response::IntoResponse,
     routing::{any, get},
 };
+use futures::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
-    net::{TcpListener, unix::SocketAddr},
+    net::TcpListener,
     sync::{Mutex, mpsc, oneshot},
 };
 use tracing_subscriber::layer::SubscriberExt;
@@ -41,14 +41,19 @@ async fn main() {
 
     // build our application with a route
     let app = Router::new()
-        .route("/", get(health_check_handler))
         .route("/ws", any(websocket_handler))
+        .route("/", get(health_check_handler))
         .with_state(state);
 
     // run it
     let listener = TcpListener::bind("0.0.0.0:8000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /**
@@ -65,9 +70,9 @@ async fn websocket_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-) -> Response {
+) -> impl IntoResponse {
     // WebSocketのハンドリング
-    ws.on_upgrade(|socket| handle_socket(socket, addr, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
 }
 
 /**
@@ -75,13 +80,12 @@ async fn websocket_handler(
  */
 async fn handle_socket(socket: WebSocket, socket_addr: SocketAddr, state: AppState) {
     // state.peers.lock().await.insert(socket_addr, so)
-    // tracing::debug!("new peer connected: {}", peer_key);
 
     // websocketの待ち受け処理
     let (sender, receiver) = socket.split();
 
     // よくわかってない、tokioのチャンネルについて理解する必要がありそう
-    let (tx, _rx) = mpsc::channel::<Message>(100);
+    let (tx, rx) = mpsc::channel::<Message>(100);
 
     // ここもよくわかってない
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -89,8 +93,9 @@ async fn handle_socket(socket: WebSocket, socket_addr: SocketAddr, state: AppSta
     // peerをappstateに登録
     // アプリ全体で任意のタイミングにpeerにメッセージを送信できるようにする
     let peer_key = add_peer(&state, socket_addr, tx).await;
+    tracing::info!("new peer connected: {}", &peer_key);
 
-    let send_task = tokio::spawn(send(sender, cancel_rx));
+    let send_task = tokio::spawn(send(sender, cancel_rx, rx));
     let recv_task = tokio::spawn(receive(receiver, cancel_tx, state.clone(), peer_key));
 
     tokio::select! {
@@ -123,10 +128,24 @@ async fn receive(
                 break;
             }
         };
-        state.peers.lock().await.values().for_each(|(addr, tx)| {
-            tracing::info!("broadcasting message to {:?}", addr);
-            let _ = tx.try_send(msg.clone());
-        });
+
+        match msg {
+            Message::Text(_) | Message::Binary(_) => {
+                // 接続中のpeerリスト全員に対してsendする
+                state.peers.lock().await.values().for_each(|(addr, tx)| {
+                    tracing::info!("broadcasting message to {:?}", addr);
+                    let _ = tx.try_send(msg.clone());
+                });
+            }
+
+            Message::Close(_frame) => {
+                // 絶対に他人へは送らない。自分の切断として処理して抜ける。
+                tracing::info!("peer {} sent Close", peer_key);
+                break;
+            }
+
+            _ => {}
+        }
     }
 
     // ここに到達したら切断している
@@ -136,7 +155,29 @@ async fn receive(
     let _ = cancel_tx.send(());
 }
 
-async fn send(_sender: SplitSink<WebSocket, Message>, _cancel_rx: oneshot::Receiver<()>) {}
+async fn send(
+    mut sender: SplitSink<WebSocket, Message>,
+    mut cancel_rx: oneshot::Receiver<()>,
+    mut rx: mpsc::Receiver<Message>,
+) {
+    loop {
+        tokio::select! {
+            // 他のpeerから送られてきたメッセージをsocketへ書き込み
+            Some(msg) = rx.recv() => {
+                if let Err(e) = sender.send(msg).await {
+                    tracing::error!("failed to send message: {}", e);
+                    break;
+                }
+            }
+
+            // 切断検知 (receiveタスク側から通知が来る)
+            _ = &mut cancel_rx => {
+                tracing::info!("send task received cancel signal");
+                break;
+            }
+        }
+    }
+}
 
 /**
  * app stateにpeerを追加する
@@ -148,11 +189,7 @@ async fn add_peer(
 ) -> String {
     let peer_key = Uuid::new_v4().to_string();
     let mut peers = state.peers.lock().await;
-    tracing::info!(
-        "new peer connected: {}, addr: {}",
-        &peer_key,
-        &socket_addr.as_pathname().unwrap().to_str().unwrap()
-    );
+    tracing::info!("new peer connected: {}, addr: {}", &peer_key, &socket_addr);
     peers.insert(peer_key.clone(), (socket_addr, peer));
     peer_key
 }
