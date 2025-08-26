@@ -15,8 +15,9 @@ export default defineConfig({
     proxy: {
       // '/api' で始まるパスへのリクエストをプロキシする
       "/ws": {
+        ws: true,
         // 転送先
-        target: "http://rust:8000",
+        target: "ws://rust:8000/ws",
         // オリジンを転送先に変更
         changeOrigin: true,
         // パスの書き換え（例: /api/users -> /users）

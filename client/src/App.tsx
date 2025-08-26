@@ -1,35 +1,43 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useCallback, useEffect, useRef, useState } from "react";
 
-function App() {
-  const [count, setCount] = useState(0)
+export const App = () => {
+  const [status, setStatus] = useState("disconnected");
+  // const [messages, setMessages] = useState([]);
+  // const [input, setInput] = useState("");
+  const wsr = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    const ws = new WebSocket("ws://localhost:8000/ws");
+    ws.addEventListener("open", () => {
+      setStatus("connected");
+      wsr.current = ws;
+    });
+
+    ws.addEventListener("message", (event) => {
+      console.info(`[ws] message: ${event.data}`);
+    });
+
+    ws.addEventListener("close", () => {
+      setStatus("closed");
+    });
+
+    ws.addEventListener("error", () => {
+      setStatus("error");
+    });
+
+    // アンマウント時に接続を閉じる
+    return () => {
+      ws.close();
+    };
+  }, []);
+
+  const sendMessage = useCallback((message: string) => {
+    wsr.current?.send(message);
+  }, []);
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
-}
-
-export default App
+    <div>
+      App connected: {status} <button onClick={() => sendMessage("ping")}>send ping</button>
+    </div>
+  );
+};
