@@ -9,6 +9,7 @@ use axum::{
 };
 use futures::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
+use redis::AsyncCommands;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     net::TcpListener,
@@ -23,11 +24,51 @@ type Peer = (SocketAddr, mpsc::Sender<Message>);
 
 #[derive(Clone)]
 struct AppState {
+    redis: Arc<RedisClient>,
     peers: Arc<Mutex<HashMap<PeerKey, Peer>>>,
 }
 
+// ----------------
+// Infrastructure: Redis wrapper
+// ----------------
+struct RedisClient {
+    client: redis::Client,
+    channel: String,
+}
+
+impl RedisClient {
+    async fn new(url: &str, channel: &str) -> anyhow::Result<Self> {
+        let client = redis::Client::open(url)?;
+        Ok(Self {
+            client,
+            channel: channel.to_string(),
+        })
+    }
+
+    // publish JSON string
+    async fn publish(&self, msg_json: String) -> anyhow::Result<()> {
+        let mut conn = self.client.get_async_connection().await?;
+        let _: () = conn
+            .publish(self.channel.as_str(), msg_json)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
+
+    // returns a PubSub connection handle to be polled
+    async fn subscribe(&self) -> anyhow::Result<redis::aio::PubSub> {
+        let conn = self.client.get_async_connection().await?;
+        let mut pubsub = conn.into_pubsub();
+        pubsub
+            .subscribe(self.channel.as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(pubsub)
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -35,9 +76,17 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // redis setup
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+    let channel = std::env::var("REDIS_CHANNEL").unwrap_or_else(|_| "ws:channel".to_string());
+
     let state = AppState {
+        redis: Arc::new(RedisClient::new(&redis_url, &channel).await?),
         peers: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    // ws:channelへサブスクライブ開始
+    start_redis_listener(state.clone()).await?;
 
     // build our application with a route
     let app = Router::new()
@@ -52,8 +101,9 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }
 
 /**
@@ -117,7 +167,7 @@ async fn receive(
     cancel_tx: oneshot::Sender<()>,
     state: AppState,
     peer_key: PeerKey,
-) {
+) -> anyhow::Result<()> {
     // ループの中でメッセージを受け取る処理
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -132,10 +182,14 @@ async fn receive(
         match msg {
             Message::Text(_) | Message::Binary(_) => {
                 // 接続中のpeerリスト全員に対してsendする
-                state.peers.lock().await.values().for_each(|(addr, tx)| {
-                    tracing::info!("broadcasting message to {:?}", addr);
-                    let _ = tx.try_send(msg.clone());
-                });
+                // state.peers.lock().await.values().for_each(|(addr, tx)| {
+                //     tracing::info!("broadcasting message to {:?}", addr);
+                //     let _ = tx.try_send(msg.clone());
+                // })
+                let msg_str = String::from(msg.to_text()?);
+                tracing::info!("publish message");
+                // redisへpublish
+                let _ = state.redis.publish(msg_str).await;
             }
 
             Message::Close(_frame) => {
@@ -153,6 +207,8 @@ async fn receive(
 
     // 送信タスクをキャンセルする
     let _ = cancel_tx.send(());
+
+    Ok(())
 }
 
 async fn send(
@@ -204,4 +260,52 @@ async fn remove_peer(state: &AppState, peer_key: &PeerKey) {
     } else {
         tracing::warn!("attempted to remove non-existent peer: {}", peer_key);
     }
+}
+
+// redisから受け取ったメッセージを自鯖に接続している全peerへ送信
+async fn start_redis_listener(state: AppState) -> anyhow::Result<()> {
+    tokio::spawn(async move {
+        loop {
+            match state.redis.subscribe().await {
+                Ok(mut pubsub) => {
+                    tracing::info!("subscribed to Redis channel: {}", state.redis.channel);
+                    let mut on_message = pubsub.on_message();
+
+                    while let Some(msg) = on_message.next().await {
+                        match msg.get_payload::<String>() {
+                            Ok(payload_str) => {
+                                // 受信そのものを必ずログ（peer 0 件でも見える）
+                                tracing::debug!("redis message received: {}", payload_str);
+
+                                // ロック中に送らない：先に送信先を集める（クローン）→ロック解放→送信
+                                let senders: Vec<(SocketAddr, mpsc::Sender<Message>)> = {
+                                    let peers = state.peers.lock().await;
+                                    peers.values().cloned().collect()
+                                };
+
+                                for (addr, tx) in senders {
+                                    tracing::info!("broadcasting message to {:?}", addr);
+                                    let _ = tx.try_send(Message::Text(payload_str.clone().into()));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to decode redis payload: {}", e);
+                            }
+                        }
+                    }
+
+                    // on_message ストリームが終了した（接続落ちなど）
+                    tracing::warn!("redis pubsub stream ended; will retry subscribe soon...");
+                }
+                Err(e) => {
+                    // 起動直後に Redis 未起動・認証失敗等があるとここに来る
+                    tracing::error!("redis subscribe failed: {} ; retrying...", e);
+                }
+            }
+
+            // 速すぎる再試行を避け、一定時間後に再接続
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    Ok(())
 }
